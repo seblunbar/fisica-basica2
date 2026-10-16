@@ -57,10 +57,10 @@
 
         // Crear la pelota
         const pelota = document.createElement('a-sphere');
-        const radius = Math.random() * 10 + 0.1;   // radio entre 0.1 y 10 m
+        const radius = Math.random() * 5 + 0.1;   // radio entre 0.1 y 10 m
         pelota.setAttribute('radius', radius);
         pelota.setAttribute('color', '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0'));
-        pelota.setAttribute('position', inicio);
+        pelota.setAttribute('position', inicio + 2);
         pelota.setAttribute('dynamic-body', `mass: ${this.data.masa}; shape: sphere; sphereRadius: ${radius}`);
 
         // Cuando el cuerpo físico ya existe, le damos velocidad inicial (v = dir * rapidez)
