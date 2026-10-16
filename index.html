@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Física básica en A-Frame</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- 1) A-Frame (el motor 3D/VR). Se usa la 1.7.1 porque es la que mejor
+          se lleva con la librería de física. -->
+  <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
+
+  <!-- 2) Motor de física (basado en Cannon.js). Agrega los componentes:
+          static-body  → objeto fijo que no se mueve (piso, rampa, paredes)
+          dynamic-body → objeto que tiene masa, cae y choca -->
+  <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-physics-system@v4.2.2/dist/aframe-physics-system.min.js"></script>
+
+  <script>
+    /*
+      COMPONENTE "lanzador"
+      Lanza una pelota en la dirección en que apunta la entidad.
+      - En la compu: tecla ESPACIO (se pone en la cámara).
+      - En el Quest: gatillo del control (se pone en el control).
+    */
+    AFRAME.registerComponent('lanzador', {
+      schema: {
+        velocidad: { type: 'number', default: 8 },   // m/s
+        masa:      { type: 'number', default: 1 },   // kg
+        maxPelotas:{ type: 'int',    default: 25 }   // para no saturar el visor
+      },
+
+      init: function () {
+        this.pelotas = [];
+        this.lanzar = this.lanzar.bind(this);
+
+        // Teclado (solo tiene sentido en la cámara)
+        if (this.el.hasAttribute('camera')) {
+          window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') this.lanzar();
+            if (e.code === 'KeyR') location.reload();   // R = reiniciar escena
+          });
+        }
+        // Gatillo de los controles del Quest
+        this.el.addEventListener('triggerdown', this.lanzar);
+      },
+
+      lanzar: function () {
+        const obj = this.el.object3D;
+
+        // Posición y dirección del lanzador en el mundo
+        const origen = new THREE.Vector3();
+        const dir = new THREE.Vector3();
+        obj.getWorldPosition(origen);
+        obj.getWorldDirection(dir);
+        dir.negate();                 // en A-Frame "al frente" es -Z
+
+        const inicio = origen.clone().add(dir.clone().multiplyScalar(0.5));
+
+        // Crear la pelota
+        const pelota = document.createElement('a-sphere');
+        pelota.setAttribute('radius', 0.15);
+        pelota.setAttribute('color', '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0'));
+        pelota.setAttribute('position', inicio);
+        pelota.setAttribute('dynamic-body', `mass: ${this.data.masa}; shape: sphere; sphereRadius: 0.15`);
+
+        // Cuando el cuerpo físico ya existe, le damos velocidad inicial (v = dir * rapidez)
+        pelota.addEventListener('body-loaded', () => {
+          const v = this.data.velocidad;
+          pelota.body.velocity.set(dir.x * v, dir.y * v, dir.z * v);
+        });
+
+        this.el.sceneEl.appendChild(pelota);
+
+        // Borrar las pelotas más viejas
+        this.pelotas.push(pelota);
+        if (this.pelotas.length > this.data.maxPelotas) {
+          const vieja = this.pelotas.shift();
+          vieja.parentNode && vieja.parentNode.removeChild(vieja);
+        }
+      }
+    });
+
+    /*
+      COMPONENTE "reporte-choque"
+      Cambia de color al objeto cuando algo lo golpea.
+      Sirve para explicar el evento "collide" en clase.
+    */
+    AFRAME.registerComponent('reporte-choque', {
+      init: function () {
+        this.el.addEventListener('collide', () => {
+          this.el.setAttribute('color', '#FF5252');
+        });
+      }
+    });
+
+    /*
+      COMPONENTE "jugador-fisico"
+      Mueve al jugador con WASD usando FÍSICA (velocidad), no teletransportando.
+      Así choca con paredes (static-body) y empuja cajas (dynamic-body).
+    */
+    AFRAME.registerComponent('jugador-fisico', {
+      schema: {
+        velocidad: { type: 'number', default: 4 }   // m/s
+      },
+
+      init: function () {
+        this.teclas = {};
+        window.addEventListener('keydown', (e) => this.teclas[e.code] = true);
+        window.addEventListener('keyup',   (e) => this.teclas[e.code] = false);
+
+        this.camara = this.el.querySelector('[camera]');
+
+        // Que el cuerpo no ruede como pelota
+        this.el.addEventListener('body-loaded', () => {
+          this.el.body.fixedRotation = true;
+          this.el.body.updateMassProperties();
+        });
+      },
+
+      tick: function () {
+        const body = this.el.body;
+        if (!body) return;
+
+        let x = 0, z = 0;
+        if (this.teclas.KeyW) z -= 1;
+        if (this.teclas.KeyS) z += 1;
+        if (this.teclas.KeyA) x -= 1;
+        if (this.teclas.KeyD) x += 1;
+
+        // Girar la dirección según hacia dónde mira la cámara
+        const yaw = this.camara.object3D.rotation.y;
+        const v = new THREE.Vector3(x, 0, z).normalize()
+          .multiplyScalar(this.data.velocidad)
+          .applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+
+        body.wakeUp();
+        body.velocity.x = v.x;
+        body.velocity.z = v.z;   // la Y la sigue controlando la gravedad
+      }
+    });
+  </script>
+</head>
+
+<body>
+  <!--
+    physics: configura el "mundo físico"
+      gravity     → aceleración en Y (m/s²). Prueben -1.62 (Luna) o -24.8 (Júpiter).
+      restitution → qué tanto rebotan las cosas (0 = nada, 1 = rebote perfecto).
+      friction    → fricción entre superficies.
+      debug: true → dibuja en alambre la forma física de cada objeto.
+  -->
+  <a-scene physics="gravity: -9.8; restitution: 0.4; friction: 0.1; debug: false">
+
+    <!-- Ambiente -->
+    <a-sky color="#BFE3F2"></a-sky>
+    <a-light type="ambient" intensity="0.6"></a-light>
+    <a-light type="directional" intensity="0.8" position="2 4 2"></a-light>
+
+    <!-- PISO: estático. Se usa una caja delgada (más estable que un plano). -->
+    <a-box static-body position="0 -0.05 0" width="20" height="0.1" depth="20" color="#7BC8A4"></a-box>
+
+    <!-- RAMPA: estática e inclinada 20° -->
+    <a-box static-body position="-3 0.6 -4" rotation="0 0 -20" width="4" height="0.1" depth="1.5" color="#8D6E63"></a-box>
+
+    <!-- Pelota que rueda por la rampa (dinámica) -->
+    <a-sphere dynamic-body="mass: 2" position="-4.5 2.5 -4" radius="0.3" color="#FFC65D"></a-sphere>
+
+    <!-- TORRE de cajas dinámicas: blanco para las pelotas -->
+    <a-box dynamic-body="mass: 1" reporte-choque position="2 0.25 -5" width="0.5" height="0.5" depth="0.5" color="#4CC3D9"></a-box>
+    <a-box dynamic-body="mass: 1" reporte-choque position="2 0.75 -5" width="0.5" height="0.5" depth="0.5" color="#4CC3D9"></a-box>
+    <a-box dynamic-body="mass: 1" reporte-choque position="2 1.25 -5" width="0.5" height="0.5" depth="0.5" color="#4CC3D9"></a-box>
+    <a-box dynamic-body="mass: 1" reporte-choque position="2.5 0.25 -5" width="0.5" height="0.5" depth="0.5" color="#4CC3D9"></a-box>
+    <a-box dynamic-body="mass: 1" reporte-choque position="2.5 0.75 -5" width="0.5" height="0.5" depth="0.5" color="#4CC3D9"></a-box>
+
+    <!-- Caída libre: dos esferas de distinta masa, misma altura.
+         ¿Cuál llega primero? (Galileo dice: las dos al mismo tiempo) -->
+    <a-sphere dynamic-body="mass: 1"  position="0 20 -6" radius="0.25" color="#EF2D5E"></a-sphere>
+    <a-sphere dynamic-body="mass: 20" position="1 20 -6" radius="0.25" color="#5E35B1"></a-sphere>
+
+    <!-- Instrucciones -->
+    <a-text value="ESPACIO / gatillo: lanzar pelota    R: reiniciar    WASD: moverse"
+            position="-3 3.2 -6" color="#222" width="7"></a-text>
+
+    <!-- PARED: estática, el jugador no la puede atravesar -->
+    <a-box static-body position="-2 1 0" width="0.2" height="2" depth="4" color="#999"></a-box>
+
+    <!-- JUGADOR: cuerpo físico (esfera invisible de 0.4 m en los pies).
+         Masa 60 kg → empuja fácil las cajas de 1 kg. -->
+    <a-entity id="rig" position="0 0.4 3"
+              dynamic-body="mass: 60; shape: sphere; sphereRadius: 0.4"
+              jugador-fisico="velocidad: 4">
+      <!-- Cámara SIN wasd-controls (si no, atraviesa todo). En la compu lanza con ESPACIO -->
+      <a-entity camera look-controls position="0 1.2 0"
+                lanzador="velocidad: 10; masa: 1"></a-entity>
+
+      <!-- Controles del Quest: lanzan con el gatillo -->
+      <a-entity laser-controls="hand: right" lanzador="velocidad: 10"></a-entity>
+      <a-entity laser-controls="hand: left"  lanzador="velocidad: 10"></a-entity>
+    </a-entity>
+
+  </a-scene>
+</body>
+</html>
