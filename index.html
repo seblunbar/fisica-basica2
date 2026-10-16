@@ -57,7 +57,7 @@
 
         // Crear la pelota
         const pelota = document.createElement('a-sphere');
-        pelota.setAttribute('radius', Math.random() * 0.1 + 0.3);
+        pelota.setAttribute('radius', (Math.random() * 0.1 + 0.1) * 16);   // radio entre 0.1 y 0.2 m
         pelota.setAttribute('color', '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0'));
         pelota.setAttribute('position', inicio);
         pelota.setAttribute('dynamic-body', `mass: ${this.data.masa}; shape: sphere; sphereRadius: 0.15`);
