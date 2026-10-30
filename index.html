@@ -85,10 +85,10 @@
       Hace dos cosas (se pone en la cámara y en cada control del Quest):
 
       1) LANZAR una pelota nueva
-         - Compu: tecla Q.   - Quest: gatillo.
+         - Compu: tecla Q.   - Quest: botón lateral (grip).
       2) AGARRAR un objeto y AVENTARLO al soltarlo
-         - Compu: mantener F apuntando al objeto, soltar F para aventar.
-         - Quest: mantener el botón lateral (grip), soltarlo para aventar.
+         - Compu: mantener clic izquierdo apuntando al objeto, soltar clic para aventar.
+         - Quest: mantener el gatillo, soltarlo para aventar.
 
       Cuando algo sale (pelota nueva o soltar un objeto agarrado) lleva:
         velocidad = (dirección * rapidez)            ← hacia donde se apunta
@@ -138,22 +138,27 @@
         this._objetivo = new THREE.Vector3();
         this._tiron = new THREE.Vector3();
 
-        // Teclado (solo tiene sentido en la cámara)
+        // Controles de teclado y mouse (solo tiene sentido en la cámara)
         if (this.el.hasAttribute('camera')) {
           window.addEventListener('keydown', (e) => {
             if (e.repeat) return;
             if (e.code === 'KeyQ') this.lanzar();     // Q = pelota nueva
-            if (e.code === 'KeyF') this.agarrar();    // F (mantener) = agarrar
             if (e.code === 'KeyR') location.reload(); // R = reiniciar escena
           });
-          window.addEventListener('keyup', (e) => {
-            if (e.code === 'KeyF') this.soltar();     // soltar F = aventar
+          
+          window.addEventListener('mousedown', (e) => {
+            if (e.button === 0) this.agarrar();       // Clic izquierdo (0) = agarrar
+          });
+          
+          window.addEventListener('mouseup', (e) => {
+            if (e.button === 0) this.soltar();        // Soltar clic = aventar
           });
         }
+        
         // Controles del Quest
-        this.el.addEventListener('triggerdown', this.lanzar);   // gatillo = pelota nueva
-        this.el.addEventListener('gripdown',    this.agarrar);  // grip (mantener) = agarrar
-        this.el.addEventListener('gripup',      this.soltar);   // soltar grip = aventar
+        this.el.addEventListener('triggerdown', this.agarrar);  // Gatillo = agarrar
+        this.el.addEventListener('triggerup',   this.soltar);   // Soltar gatillo = aventar
+        this.el.addEventListener('gripdown',    this.lanzar);   // Grip (botón lateral) = pelota nueva
       },
 
       /* Cada cuadro medimos la velocidad lineal y angular del lanzador
@@ -452,7 +457,7 @@
     <a-sphere dynamic-body="mass: 20" position="1 20 -6" radius="0.25" color="#5E35B1"></a-sphere>
 
     <!-- Instrucciones -->
-    <a-text value="Q / gatillo: lanzar pelota    F (mantener): agarrar, soltar para aventar    E: gravedad    R: reiniciar    WASD: moverse"
+    <a-text value="Q / grip: lanzar pelota    Clic izq / gatillo: agarrar, soltar para aventar    E: gravedad    R: reiniciar    WASD: moverse"
             position="-4.5 3.2 -6" color="#222" width="9"></a-text>
 
     <!-- PARED: estática, el jugador no la puede atravesar -->
@@ -464,7 +469,7 @@
               dynamic-body="mass: 60; shape: sphere; sphereRadius: 0.4"
               jugador-fisico="velocidad: 4">
       <!-- Cámara SIN wasd-controls (si no, atraviesa todo).
-           En la compu: Q lanza una pelota, F (mantener) agarra y al soltar se aventa.
+           En la compu: Q lanza una pelota, clic izquierdo (mantener) agarra y al soltar se aventa.
            La miranda (anillo) ayuda a apuntar. -->
       <a-entity camera look-controls position="0 1.2 0"
                 lanzador="velocidad: 10; masa: 1">
@@ -472,7 +477,7 @@
                 material="shader: flat; color: #ffffff; opacity: 0.7"></a-ring>
       </a-entity>
 
-      <!-- Controles del Quest: gatillo = pelota nueva, grip (mantener) = agarrar y aventar
+      <!-- Controles del Quest: grip = pelota nueva, gatillo (mantener) = agarrar y aventar
            (A / X invierten la gravedad) -->
       <a-entity laser-controls="hand: right" lanzador="velocidad: 10"></a-entity>
       <a-entity laser-controls="hand: left"  lanzador="velocidad: 10"></a-entity>
