@@ -82,31 +82,44 @@
 
     /*
       COMPONENTE "lanzador"
-      Lanza una pelota en la dirección en que apunta la entidad.
-      - En la compu: tecla ESPACIO (se pone en la cámara).
-      - En el Quest: gatillo del control (se pone en el control).
+      Hace dos cosas (se pone en la cámara y en cada control del Quest):
 
-      La pelota sale con:
-        velocidad = (dirección * rapidez)            ← hacia donde mira
+      1) LANZAR una pelota nueva
+         - Compu: tecla Q.   - Quest: gatillo.
+      2) AGARRAR un objeto y AVENTARLO al soltarlo
+         - Compu: mantener F apuntando al objeto, soltar F para aventar.
+         - Quest: mantener el botón lateral (grip), soltarlo para aventar.
+
+      Cuando algo sale (pelota nueva o soltar un objeto agarrado) lleva:
+        velocidad = (dirección * rapidez)            ← hacia donde se apunta
                   + velocidad lineal del lanzador    ← si el jugador se mueve
                   + (ω × brazo)                      ← si el lanzador está girando
       donde ω es la velocidad angular (rad/s) y "brazo" es la distancia a la que
-      se suelta la pelota (como una honda: mientras más lejos, más velocidad tangencial).
+      está el objeto (como una honda: mientras más lejos, más velocidad tangencial).
     */
     AFRAME.registerComponent('lanzador', {
       schema: {
-        velocidad:  { type: 'number', default: 8 },    // m/s hacia donde se apunta
+        velocidad:  { type: 'number', default: 8 },    // m/s de las pelotas nuevas
         masa:       { type: 'number', default: 1 },    // kg
         maxPelotas: { type: 'int',    default: 25 },   // para no saturar el visor
         radioMin:   { type: 'number', default: 0.1 },  // m
         radioMax:   { type: 'number', default: 0.8 },  // m
-        brazo:      { type: 'number', default: 1 },    // m (palanca para el giro)
-        maxExtra:   { type: 'number', default: 20 }    // tope de velocidad heredada (m/s)
+        brazo:      { type: 'number', default: 1 },    // m (palanca para el giro al lanzar)
+        maxExtra:   { type: 'number', default: 20 },   // tope de velocidad heredada (m/s)
+        alcance:    { type: 'number', default: 8 },    // m: qué tan lejos puede agarrar
+        impulso:    { type: 'number', default: 6 }     // m/s hacia donde se ve al soltar lo agarrado
       },
 
       init: function () {
         this.pelotas = [];
-        this.lanzar = this.lanzar.bind(this);
+        this.lanzar  = this.lanzar.bind(this);
+        this.agarrar = this.agarrar.bind(this);
+        this.soltar  = this.soltar.bind(this);
+
+        // Lo que tenemos agarrado ahora mismo
+        this.agarrado = null;
+        this.distAgarre = 1.5;     // distancia a la que se sostiene
+        this.guardado = null;      // grupo de colisión original del objeto agarrado
 
         // Para medir cómo se mueve / gira el lanzador entre cuadros
         this.posPrev  = new THREE.Vector3();
@@ -121,19 +134,30 @@
         this._dq = new THREE.Quaternion();
         this._vL = new THREE.Vector3();
         this._w = new THREE.Vector3();
+        this._dir = new THREE.Vector3();
+        this._objetivo = new THREE.Vector3();
+        this._tiron = new THREE.Vector3();
 
         // Teclado (solo tiene sentido en la cámara)
         if (this.el.hasAttribute('camera')) {
           window.addEventListener('keydown', (e) => {
-            if (e.code === 'Space' && !e.repeat) { e.preventDefault(); this.lanzar(); }
-            if (e.code === 'KeyR') location.reload();   // R = reiniciar escena
+            if (e.repeat) return;
+            if (e.code === 'KeyQ') this.lanzar();     // Q = pelota nueva
+            if (e.code === 'KeyF') this.agarrar();    // F (mantener) = agarrar
+            if (e.code === 'KeyR') location.reload(); // R = reiniciar escena
+          });
+          window.addEventListener('keyup', (e) => {
+            if (e.code === 'KeyF') this.soltar();     // soltar F = aventar
           });
         }
-        // Gatillo de los controles del Quest
-        this.el.addEventListener('triggerdown', this.lanzar);
+        // Controles del Quest
+        this.el.addEventListener('triggerdown', this.lanzar);   // gatillo = pelota nueva
+        this.el.addEventListener('gripdown',    this.agarrar);  // grip (mantener) = agarrar
+        this.el.addEventListener('gripup',      this.soltar);   // soltar grip = aventar
       },
 
-      /* Cada cuadro medimos la velocidad lineal y angular del lanzador */
+      /* Cada cuadro medimos la velocidad lineal y angular del lanzador
+         y, si hay algo agarrado, lo jalamos hacia la mano */
       tick: function (time, delta) {
         if (!delta) return;
         const dt = delta / 1000;
@@ -149,7 +173,6 @@
           // Velocidad angular: rotación entre cuadros (en marco del mundo)
           // dq = q_ahora * q_antes⁻¹  →  eje y ángulo  →  ω = eje * ángulo / Δt
           this._dq.copy(this.quatPrev).invert().premultiply(this._quat);
-          // (arriba: dq = q_ahora * q_antes⁻¹ ya que premultiply pone _quat a la izquierda)
           if (this._dq.w < 0) {   // tomar el camino corto
             this._dq.x *= -1; this._dq.y *= -1; this._dq.z *= -1; this._dq.w *= -1;
           }
@@ -171,6 +194,115 @@
         this.posPrev.copy(this._pos);
         this.quatPrev.copy(this._quat);
         this.tienePrev = true;
+
+        // ---- Sostener el objeto agarrado ----
+        if (this.agarrado) {
+          const el = this.agarrado;
+          const body = el.body;
+          if (!body || !el.parentNode) {      // lo borraron o aún no tiene cuerpo
+            this.agarrado = null;
+            return;
+          }
+          // Punto frente a la mano donde debe quedar el objeto
+          obj.getWorldDirection(this._dir).negate();
+          this._objetivo.copy(this._pos).addScaledVector(this._dir, this.distAgarre);
+
+          // Velocidad que lo lleva hacia ese punto (así sigue chocando con paredes y piso)
+          const p = body.position;
+          this._tiron.set(this._objetivo.x - p.x, this._objetivo.y - p.y, this._objetivo.z - p.z)
+                     .multiplyScalar(18).clampLength(0, 40);
+          body.velocity.set(this._tiron.x, this._tiron.y, this._tiron.z);
+          body.angularVelocity.set(0, 0, 0);
+          body.wakeUp();
+        }
+      },
+
+      /* Velocidad de salida = hacia donde se apunta + movimiento + giro */
+      velocidadSalida: function (rapidez, brazo, dir) {
+        const v = dir.clone().multiplyScalar(rapidez);
+
+        // lo que ya se mueve el lanzador (caminar, mover el control...)
+        const extra = this.velLineal.clone();
+
+        // por el giro: v_tangencial = ω × r   (r = vector del lanzador al objeto)
+        extra.add(this.velAngular.clone().cross(dir.clone().multiplyScalar(brazo)));
+
+        extra.clampLength(0, this.data.maxExtra);
+        return v.add(extra);
+      },
+
+      /* Busca el objeto dinámico al que se está apuntando (el más cercano) */
+      buscarObjetivo: function () {
+        const obj = this.el.object3D;
+        const origen = new THREE.Vector3();
+        const dir = new THREE.Vector3();
+        obj.getWorldPosition(origen);
+        obj.getWorldDirection(dir).negate();
+        const rayo = new THREE.Ray(origen, dir);
+
+        const caja = new THREE.Box3();
+        const esfera = new THREE.Sphere();
+        const punto = new THREE.Vector3();
+        let mejor = null, mejorDist = this.data.alcance, mejorRadio = 0.3;
+
+        document.querySelectorAll('[dynamic-body]').forEach((el) => {
+          if (el.id === 'rig' || !el.body) return;       // el jugador no se agarra a sí mismo
+          caja.setFromObject(el.object3D);
+          caja.getBoundingSphere(esfera);
+          const radio = esfera.radius;
+          esfera.radius += 0.25;                         // un poco de tolerancia al apuntar
+          if (!rayo.intersectSphere(esfera, punto)) return;
+          const d = origen.distanceTo(esfera.center);
+          if (d < mejorDist) { mejor = el; mejorDist = d; mejorRadio = radio; }
+        });
+
+        if (!mejor) return null;
+        return { el: mejor, dist: mejorDist, radio: mejorRadio };
+      },
+
+      agarrar: function () {
+        if (this.agarrado) return;
+        const objetivo = this.buscarObjetivo();
+        if (!objetivo) return;
+
+        const el = objetivo.el;
+        this.agarrado = el;
+        // Lo sostenemos a la distancia a la que estaba (ni pegado ni muy lejos)
+        this.distAgarre = Math.min(6, Math.max(objetivo.dist, objetivo.radio + 0.8));
+
+        // Mientras se sostiene, no choca con el jugador (grupo 2, como las pelotas)
+        const body = el.body;
+        this.guardado = { grupo: body.collisionFilterGroup, mascara: body.collisionFilterMask };
+        body.collisionFilterGroup = 2;
+        body.collisionFilterMask  = 3;
+
+        // Brillito para saber que está agarrado
+        el.setAttribute('material', 'emissive', '#ffffff');
+        el.setAttribute('material', 'emissiveIntensity', 0.35);
+      },
+
+      soltar: function () {
+        const el = this.agarrado;
+        if (!el) return;
+        this.agarrado = null;
+
+        const body = el.body;
+        if (body) {
+          // ¡Aventar! Misma fórmula: dirección + movimiento + giro
+          const dir = new THREE.Vector3();
+          this.el.object3D.getWorldDirection(dir).negate();
+          const v = this.velocidadSalida(this.data.impulso, this.distAgarre, dir);
+          body.velocity.set(v.x, v.y, v.z);
+          body.wakeUp();
+
+          // Regresar a su grupo de colisión original
+          if (this.guardado) {
+            body.collisionFilterGroup = this.guardado.grupo;
+            body.collisionFilterMask  = this.guardado.mascara;
+          }
+        }
+        this.guardado = null;
+        el.setAttribute('material', 'emissiveIntensity', 0);
       },
 
       lanzar: function () {
@@ -180,8 +312,7 @@
         const origen = new THREE.Vector3();
         const dir = new THREE.Vector3();
         obj.getWorldPosition(origen);
-        obj.getWorldDirection(dir);
-        dir.negate();                 // en A-Frame "al frente" es -Z
+        obj.getWorldDirection(dir).negate();   // en A-Frame "al frente" es -Z
 
         const inicio = origen.clone().add(dir.clone().multiplyScalar(0.5));
 
@@ -195,19 +326,8 @@
         pelota.setAttribute('position', { x: inicio.x, y: inicio.y, z: inicio.z });
         pelota.setAttribute('dynamic-body', `mass: ${this.data.masa}; shape: sphere; sphereRadius: ${radius}`);
 
-        // ---- Velocidad inicial ----
-        // 1) hacia donde se apunta
-        const v = dir.clone().multiplyScalar(this.data.velocidad);
-
-        // 2) lo que ya se mueve el lanzador (caminar, mover el control...)
-        const extra = this.velLineal.clone();
-
-        // 3) por el giro: v_tangencial = ω × r   (r = vector del lanzador a la pelota)
-        const brazo = dir.clone().multiplyScalar(this.data.brazo);
-        extra.add(this.velAngular.clone().cross(brazo));
-
-        extra.clampLength(0, this.data.maxExtra);
-        v.add(extra);
+        // Velocidad inicial: hacia donde se apunta + movimiento + giro
+        const v = this.velocidadSalida(this.data.velocidad, this.data.brazo, dir);
 
         // Cuando el cuerpo físico ya existe, le damos la velocidad inicial
         pelota.addEventListener('body-loaded', () => {
@@ -332,8 +452,8 @@
     <a-sphere dynamic-body="mass: 20" position="1 20 -6" radius="0.25" color="#5E35B1"></a-sphere>
 
     <!-- Instrucciones -->
-    <a-text value="ESPACIO / gatillo: lanzar pelota    E: invertir gravedad    R: reiniciar    WASD: moverse"
-            position="-3.5 3.2 -6" color="#222" width="8"></a-text>
+    <a-text value="Q / gatillo: lanzar pelota    F (mantener): agarrar, soltar para aventar    E: gravedad    R: reiniciar    WASD: moverse"
+            position="-4.5 3.2 -6" color="#222" width="9"></a-text>
 
     <!-- PARED: estática, el jugador no la puede atravesar -->
     <a-box static-body position="-2 1 0" width="0.2" height="2" depth="4" color="#999"></a-box>
@@ -343,11 +463,17 @@
     <a-entity id="rig" position="0 0.4 3"
               dynamic-body="mass: 60; shape: sphere; sphereRadius: 0.4"
               jugador-fisico="velocidad: 4">
-      <!-- Cámara SIN wasd-controls (si no, atraviesa todo). En la compu lanza con ESPACIO -->
+      <!-- Cámara SIN wasd-controls (si no, atraviesa todo).
+           En la compu: Q lanza una pelota, F (mantener) agarra y al soltar se aventa.
+           La miranda (anillo) ayuda a apuntar. -->
       <a-entity camera look-controls position="0 1.2 0"
-                lanzador="velocidad: 10; masa: 1"></a-entity>
+                lanzador="velocidad: 10; masa: 1">
+        <a-ring position="0 0 -1" radius-inner="0.008" radius-outer="0.014"
+                material="shader: flat; color: #ffffff; opacity: 0.7"></a-ring>
+      </a-entity>
 
-      <!-- Controles del Quest: lanzan con el gatillo (A / X invierten la gravedad) -->
+      <!-- Controles del Quest: gatillo = pelota nueva, grip (mantener) = agarrar y aventar
+           (A / X invierten la gravedad) -->
       <a-entity laser-controls="hand: right" lanzador="velocidad: 10"></a-entity>
       <a-entity laser-controls="hand: left"  lanzador="velocidad: 10"></a-entity>
     </a-entity>

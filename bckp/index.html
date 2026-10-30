@@ -16,31 +16,161 @@
 
   <script>
     /*
+      COMPONENTE "filtros-colision"  (va en la <a-scene>)
+      Decide quién choca con quién usando los "grupos de colisión" de Cannon.
+        - Grupo 1: el mundo y el jugador (por defecto).
+        - Grupo 2: las pelotas lanzadas.
+      Las pelotas chocan con el mundo y entre ellas, pero NO con el jugador.
+      (Cannon solo hace chocar a A y B si grupo(A) & máscara(B) y grupo(B) & máscara(A)).
+    */
+    AFRAME.registerComponent('filtros-colision', {
+      init: function () {
+        // "body-loaded" sube (burbujea) hasta la escena, así que lo escuchamos aquí
+        this.el.addEventListener('body-loaded', (e) => {
+          const body = e.target.body;
+          if (!body) return;
+
+          if (e.target.classList.contains('pelota')) {
+            body.collisionFilterGroup = 2;   // soy una pelota lanzada
+            body.collisionFilterMask  = 3;   // choco con grupo 1 (mundo) y 2 (otras pelotas)
+          } else {
+            body.collisionFilterGroup = 1;
+            body.collisionFilterMask  = 0xFFFF;  // el resto choca con todo, pelotas incluidas
+          }
+        });
+      }
+    });
+
+    /*
+      COMPONENTE "gravedad-invertible"  (va en la <a-scene>)
+      Tecla E (o botón A / X del Quest): invierte la gravedad.
+    */
+    AFRAME.registerComponent('gravedad-invertible', {
+      schema: {
+        g: { type: 'number', default: 9.8 }   // magnitud de la gravedad (m/s²)
+      },
+
+      init: function () {
+        this.invertida = false;
+        this.colorCielo = '#BFE3F2';
+        this.toggle = this.toggle.bind(this);
+
+        window.addEventListener('keydown', (e) => {
+          if (e.code === 'KeyE' && !e.repeat) this.toggle();
+        });
+        // Controles del Quest (los eventos de los controles suben hasta la escena)
+        this.el.addEventListener('abuttondown', this.toggle);
+        this.el.addEventListener('xbuttondown', this.toggle);
+      },
+
+      toggle: function () {
+        const driver = this.el.systems.physics && this.el.systems.physics.driver;
+        if (!driver || !driver.world) return;
+
+        this.invertida = !this.invertida;
+        const gy = this.invertida ? this.data.g : -this.data.g;
+        driver.world.gravity.set(0, gy, 0);
+
+        // Despertar todos los cuerpos para que reaccionen al instante
+        driver.world.bodies.forEach((b) => b.wakeUp());
+
+        // Cambio de color del cielo para notar el estado
+        const cielo = document.querySelector('a-sky');
+        if (cielo) cielo.setAttribute('color', this.invertida ? '#E1BEE7' : '#BFE3F2');
+      }
+    });
+
+    /*
       COMPONENTE "lanzador"
       Lanza una pelota en la dirección en que apunta la entidad.
       - En la compu: tecla ESPACIO (se pone en la cámara).
       - En el Quest: gatillo del control (se pone en el control).
+
+      La pelota sale con:
+        velocidad = (dirección * rapidez)            ← hacia donde mira
+                  + velocidad lineal del lanzador    ← si el jugador se mueve
+                  + (ω × brazo)                      ← si el lanzador está girando
+      donde ω es la velocidad angular (rad/s) y "brazo" es la distancia a la que
+      se suelta la pelota (como una honda: mientras más lejos, más velocidad tangencial).
     */
     AFRAME.registerComponent('lanzador', {
       schema: {
-        velocidad: { type: 'number', default: 8 },   // m/s
-        masa:      { type: 'number', default: 1 },   // kg
-        maxPelotas:{ type: 'int',    default: 25 }   // para no saturar el visor
+        velocidad:  { type: 'number', default: 8 },    // m/s hacia donde se apunta
+        masa:       { type: 'number', default: 1 },    // kg
+        maxPelotas: { type: 'int',    default: 25 },   // para no saturar el visor
+        radioMin:   { type: 'number', default: 0.1 },  // m
+        radioMax:   { type: 'number', default: 0.8 },  // m
+        brazo:      { type: 'number', default: 1 },    // m (palanca para el giro)
+        maxExtra:   { type: 'number', default: 20 }    // tope de velocidad heredada (m/s)
       },
 
       init: function () {
         this.pelotas = [];
         this.lanzar = this.lanzar.bind(this);
 
+        // Para medir cómo se mueve / gira el lanzador entre cuadros
+        this.posPrev  = new THREE.Vector3();
+        this.quatPrev = new THREE.Quaternion();
+        this.velLineal   = new THREE.Vector3();   // m/s (suavizada)
+        this.velAngular  = new THREE.Vector3();   // rad/s (suavizada)
+        this.tienePrev = false;
+
+        // Auxiliares (para no crear objetos nuevos cada cuadro)
+        this._pos = new THREE.Vector3();
+        this._quat = new THREE.Quaternion();
+        this._dq = new THREE.Quaternion();
+        this._vL = new THREE.Vector3();
+        this._w = new THREE.Vector3();
+
         // Teclado (solo tiene sentido en la cámara)
         if (this.el.hasAttribute('camera')) {
           window.addEventListener('keydown', (e) => {
-            if (e.code === 'Space') this.lanzar();
+            if (e.code === 'Space' && !e.repeat) { e.preventDefault(); this.lanzar(); }
             if (e.code === 'KeyR') location.reload();   // R = reiniciar escena
           });
         }
         // Gatillo de los controles del Quest
         this.el.addEventListener('triggerdown', this.lanzar);
+      },
+
+      /* Cada cuadro medimos la velocidad lineal y angular del lanzador */
+      tick: function (time, delta) {
+        if (!delta) return;
+        const dt = delta / 1000;
+
+        const obj = this.el.object3D;
+        obj.getWorldPosition(this._pos);
+        obj.getWorldQuaternion(this._quat);
+
+        if (this.tienePrev && dt < 0.1) {   // si hubo un tirón (pestaña en pausa) lo ignoramos
+          // Velocidad lineal = Δposición / Δt
+          this._vL.copy(this._pos).sub(this.posPrev).divideScalar(dt);
+
+          // Velocidad angular: rotación entre cuadros (en marco del mundo)
+          // dq = q_ahora * q_antes⁻¹  →  eje y ángulo  →  ω = eje * ángulo / Δt
+          this._dq.copy(this.quatPrev).invert().premultiply(this._quat);
+          // (arriba: dq = q_ahora * q_antes⁻¹ ya que premultiply pone _quat a la izquierda)
+          if (this._dq.w < 0) {   // tomar el camino corto
+            this._dq.x *= -1; this._dq.y *= -1; this._dq.z *= -1; this._dq.w *= -1;
+          }
+          const angulo = 2 * Math.acos(Math.min(1, this._dq.w));
+          const s = Math.sqrt(1 - this._dq.w * this._dq.w);
+          if (s < 1e-6) {
+            this._w.set(0, 0, 0);
+          } else {
+            this._w.set(this._dq.x / s, this._dq.y / s, this._dq.z / s)
+                   .multiplyScalar(angulo / dt);
+          }
+
+          // Suavizado exponencial (evita que un cuadro "raro" dispare la pelota)
+          const a = 1 - Math.exp(-dt / 0.08);
+          this.velLineal.lerp(this._vL, a);
+          this.velAngular.lerp(this._w, a);
+        }
+
+        this.posPrev.copy(this._pos);
+        this.quatPrev.copy(this._quat);
+        this.tienePrev = true;
       },
 
       lanzar: function () {
@@ -55,18 +185,33 @@
 
         const inicio = origen.clone().add(dir.clone().multiplyScalar(0.5));
 
-        // Crear la pelota
+        // Crear la pelota (con color vivo y aleatorio)
         const pelota = document.createElement('a-sphere');
-        const radius = Math.random() * 5 + 0.1;   // radio entre 0.1 y 10 m
+        const radius = this.data.radioMin + Math.random() * (this.data.radioMax - this.data.radioMin);
+        const tono = Math.floor(Math.random() * 360);
+        pelota.classList.add('pelota');   // "filtros-colision" usa esta clase
         pelota.setAttribute('radius', radius);
-        pelota.setAttribute('color', '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0'));
-        pelota.setAttribute('position', inicio + 2);
+        pelota.setAttribute('color', `hsl(${tono}, 85%, 55%)`);
+        pelota.setAttribute('position', { x: inicio.x, y: inicio.y, z: inicio.z });
         pelota.setAttribute('dynamic-body', `mass: ${this.data.masa}; shape: sphere; sphereRadius: ${radius}`);
 
-        // Cuando el cuerpo físico ya existe, le damos velocidad inicial (v = dir * rapidez)
+        // ---- Velocidad inicial ----
+        // 1) hacia donde se apunta
+        const v = dir.clone().multiplyScalar(this.data.velocidad);
+
+        // 2) lo que ya se mueve el lanzador (caminar, mover el control...)
+        const extra = this.velLineal.clone();
+
+        // 3) por el giro: v_tangencial = ω × r   (r = vector del lanzador a la pelota)
+        const brazo = dir.clone().multiplyScalar(this.data.brazo);
+        extra.add(this.velAngular.clone().cross(brazo));
+
+        extra.clampLength(0, this.data.maxExtra);
+        v.add(extra);
+
+        // Cuando el cuerpo físico ya existe, le damos la velocidad inicial
         pelota.addEventListener('body-loaded', () => {
-          const v = this.data.velocidad;
-          pelota.body.velocity.set(dir.x * v, dir.y * v, dir.z * v);
+          pelota.body.velocity.set(v.x, v.y, v.z);
         });
 
         this.el.sceneEl.appendChild(pelota);
@@ -148,8 +293,12 @@
       restitution → qué tanto rebotan las cosas (0 = nada, 1 = rebote perfecto).
       friction    → fricción entre superficies.
       debug: true → dibuja en alambre la forma física de cada objeto.
+    filtros-colision   → las pelotas lanzadas no chocan con el jugador.
+    gravedad-invertible → tecla E (o A/X en el Quest) invierte la gravedad.
   -->
-  <a-scene physics="gravity: -9.8; restitution: 0.4; friction: 0.1; debug: false">
+  <a-scene physics="gravity: -9.8; restitution: 0.4; friction: 0.1; debug: false"
+           filtros-colision
+           gravedad-invertible="g: 9.8">
 
     <!-- Ambiente -->
     <a-sky color="#BFE3F2"></a-sky>
@@ -158,6 +307,11 @@
 
     <!-- PISO: estático. Se usa una caja delgada (más estable que un plano). -->
     <a-box static-body position="0 -0.05 0" width="20" height="0.1" depth="20" color="#7BC8A4"></a-box>
+
+    <!-- TECHO: con la gravedad invertida todo "cae" hacia arriba; esto lo detiene a 30 m.
+         Semitransparente para que se note. -->
+    <a-box static-body position="0 30.05 0" width="20" height="0.1" depth="20"
+           color="#B39DDB" opacity="0.35" transparent="true"></a-box>
 
     <!-- RAMPA: estática e inclinada 20° -->
     <a-box static-body position="-3 0.6 -4" rotation="0 0 -20" width="4" height="0.1" depth="1.5" color="#8D6E63"></a-box>
@@ -178,8 +332,8 @@
     <a-sphere dynamic-body="mass: 20" position="1 20 -6" radius="0.25" color="#5E35B1"></a-sphere>
 
     <!-- Instrucciones -->
-    <a-text value="ESPACIO / gatillo: lanzar pelota    R: reiniciar    WASD: moverse"
-            position="-3 3.2 -6" color="#222" width="7"></a-text>
+    <a-text value="ESPACIO / gatillo: lanzar pelota    E: invertir gravedad    R: reiniciar    WASD: moverse"
+            position="-3.5 3.2 -6" color="#222" width="8"></a-text>
 
     <!-- PARED: estática, el jugador no la puede atravesar -->
     <a-box static-body position="-2 1 0" width="0.2" height="2" depth="4" color="#999"></a-box>
@@ -193,7 +347,7 @@
       <a-entity camera look-controls position="0 1.2 0"
                 lanzador="velocidad: 10; masa: 1"></a-entity>
 
-      <!-- Controles del Quest: lanzan con el gatillo -->
+      <!-- Controles del Quest: lanzan con el gatillo (A / X invierten la gravedad) -->
       <a-entity laser-controls="hand: right" lanzador="velocidad: 10"></a-entity>
       <a-entity laser-controls="hand: left"  lanzador="velocidad: 10"></a-entity>
     </a-entity>
